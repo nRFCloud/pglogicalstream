@@ -109,10 +109,12 @@ func NewPgStream(ctx context.Context, config PgStreamConfig) (*Stream, error) {
 
 	var confirmedFlushLSNUnparsed string
 	var consistentPoint string
+	var slotActive bool
+	var slotSynced bool
 	//var snapshotName string
 
-	confirmedFlushResult := dbConn.QueryRow(ctx, fmt.Sprintf("SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = '%s'", config.SlotName))
-	if err := confirmedFlushResult.Scan(&confirmedFlushLSNUnparsed); err != nil {
+	confirmedFlushResult := dbConn.QueryRow(ctx, fmt.Sprintf("SELECT confirmed_flush_lsn, active, synced FROM pg_replication_slots WHERE slot_name = '%s'", config.SlotName))
+	if err := confirmedFlushResult.Scan(&confirmedFlushLSNUnparsed, &slotActive, &slotSynced); err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.WithDetail(err, "failed to get confirmed flush LSN")
 		}
@@ -129,6 +131,14 @@ func NewPgStream(ctx context.Context, config PgStreamConfig) (*Stream, error) {
 		consistentPoint = result.ConsistentPoint
 		//snapshotName = result.SnapshotName
 	} else {
+		if slotActive {
+			logger.Debugf("Replication slot %s is already active", config.SlotName)
+			return nil, ReplicationSlotInUseError{SlotName: config.SlotName}
+		}
+		if slotSynced {
+			logger.Debugf("Replication slot was synced from a standby and cannot be used for logical replication")
+			return nil, ReplicationSlotSyncedError{SlotName: config.SlotName}
+		}
 		logger.Debugf("Replication slot %s with LSN %s exists, using it", config.SlotName, confirmedFlushLSNUnparsed)
 		consistentPoint = confirmedFlushLSNUnparsed
 	}
@@ -361,4 +371,20 @@ func (s *Stream) Stop() error {
 
 	s.logger.Info("Logical replication stream stopped")
 	return nil
+}
+
+type ReplicationSlotInUseError struct {
+	SlotName string
+}
+
+func (e ReplicationSlotInUseError) Error() string {
+	return fmt.Sprintf("replication slot %s is already active", e.SlotName)
+}
+
+type ReplicationSlotSyncedError struct {
+	SlotName string
+}
+
+func (e ReplicationSlotSyncedError) Error() string {
+	return fmt.Sprintf("replication slot %s was synced from a standby, and cannot be used for logical replication", e.SlotName)
 }
