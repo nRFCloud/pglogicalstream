@@ -2,18 +2,19 @@ package main
 
 import (
 	"context"
-	"github.com/charmbracelet/log"
-	"github.com/jackc/pgx/v5"
-	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"net/http"
 	"os"
 	"os/signal"
 	"pglogicalstream/listener"
 	"syscall"
 	"time"
+
+	"github.com/charmbracelet/log"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type metrics struct {
@@ -72,14 +73,17 @@ func newMetrics(reg *prometheus.Registry) *metrics {
 }
 
 func main() {
-	go doListen()
+	go func() {
+		doListen()
+		os.Exit(0)
+	}()
 
 	DefaultShutdownHook.WaitForExit()
 }
 
 func doListen() {
 	connConfig, err := pgx.ParseConfig(
-		"postgres://postgres:postgres@central-1.brumby-dragon.ts.net/postgres?sslmode=disable",
+		"postgres://john:eGqpHPBXAPkNBrTovdMWwXghhht4g0SfrqdJmzmzmotOGCAFEAZqi7NA4Fv4Txhl@default-best-cluster.brumby-dragon.ts.net/postgres",
 	)
 	if err != nil {
 		panic(err)
@@ -90,11 +94,7 @@ func doListen() {
 		ReportCaller: true,
 	})
 
-	changeChannel := make(chan listener.WalChanges)
-	mReg := prometheus.NewRegistry()
-	m := newMetrics(mReg)
-
-	http.Handle("/metrics", promhttp.HandlerFor(mReg, promhttp.HandlerOpts{}))
+	changeChannel := make(chan listener.WalMessage)
 
 	streamConfig := listener.PgStreamConfig{
 		DbConfig:              *connConfig,
@@ -107,7 +107,7 @@ func doListen() {
 		ChangeChannel:         changeChannel,
 	}
 
-	natsConnection, err := nats.Connect("nats://central-1.brumby-dragon.ts.net:4222")
+	natsConnection, err := nats.Connect("nats://default-nats-cluster.brumby-dragon.ts.net:4222")
 	if err != nil {
 		logger.Errorf("error connecting to nats: %s", err)
 		return
@@ -116,14 +116,13 @@ func doListen() {
 	defer natsConnection.Close()
 
 	logger.Debugf("Waiting for lock")
-	lock, err := NewNatsLock(context.Background(), natsConnection, "test_lock")
+	lock, err := NewNatsKVLock(context.Background(), natsConnection, "test_lock", 30*time.Second, 10*time.Second)
 
 	if err != nil {
 		logger.Errorf("error acquiring lock: %s", err)
+
 		return
 	}
-
-	defer lock.Unlock()
 
 	DefaultShutdownHook.AddHook(func() { lock.Unlock() })
 
@@ -143,19 +142,18 @@ func doListen() {
 				stream.Stop()
 			}
 			if msg.Error != nil {
-				logger.Errorf("error: %s", msg.Error)
+				logger.Error("error", "error", msg.Error)
 				stream.Stop()
 				break
 			}
-			//logger.Info("Received message", "lsn", msg.Lsn, "changes", msg.Changes)
-			err = stream.AckLSN(msg.Lsn)
+			logger.Info("Received message", "lsn", msg.Change.Lsn, "count", len(msg.Change.Changes))
+			for _, change := range msg.Change.Changes {
+				logger.Info("Change", "table", change.Table, "type", change.Kind, "schema", change.Schema, "New", change.New, "Old", change.Old)
+			}
+			err = stream.AckLSN(msg.Change.Lsn)
 			if err != nil {
 				logger.Errorf("error acknowledging LSN: %s", err)
 				stream.Stop()
-			}
-			m.processedTransactions.WithLabelValues(msg.Changes[0].Table).Inc()
-			for _, change := range msg.Changes {
-				m.processedChanges.WithLabelValues(change.Table).Inc()
 			}
 		}
 	}
@@ -163,109 +161,118 @@ func doListen() {
 	logger.Info("Done")
 }
 
-type NatsLock struct {
-	client           *nats.Conn
-	jsContext        jetstream.JetStream
-	lockName         string
-	lockDeliverGroup string
-	LockCtx          context.Context
-	cancel           context.CancelFunc
-	lockMsg          jetstream.Msg
+type NatsKVLock struct {
+	client          *nats.Conn
+	kv              jetstream.KeyValue
+	LockCtx         context.Context
+	cancel          context.CancelFunc
+	ownerId         string
+	lockName        string
+	kvWatcher       jetstream.KeyWatcher
+	lockRevision    uint64
+	lockExpireDelay time.Duration
+	lockTTL         time.Duration
 }
 
-func NewNatsLock(ctx context.Context, client *nats.Conn, lockGroup string) (*NatsLock, error) {
+func NewNatsKVLock(ctx context.Context, client *nats.Conn, lockName string, lockTTL time.Duration, lockExpireDelay time.Duration) (*NatsKVLock, error) {
 	lockCtx, cancel := context.WithCancel(ctx)
+	ownerId := uuid.New().String()
 
-	jsContext, err := jetstream.New(client)
-
+	js, err := jetstream.New(client)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 
-	lock := &NatsLock{
-		client:           client,
-		jsContext:        jsContext,
-		lockName:         lockGroup,
-		lockDeliverGroup: lockGroup + ".group",
-		LockCtx:          lockCtx,
-		cancel:           cancel,
-	}
-
-	stream, err := jsContext.CreateOrUpdateStream(lockCtx, jetstream.StreamConfig{
-		Name:                 lockGroup,
-		Subjects:             []string{lockGroup + ".*"},
-		Storage:              jetstream.FileStorage,
-		MaxMsgs:              1,
-		Discard:              jetstream.DiscardNew,
-		MaxMsgsPerSubject:    1,
-		Retention:            jetstream.WorkQueuePolicy,
-		DiscardNewPerSubject: true,
+	// Create or update the key value store
+	kv, err := js.CreateOrUpdateKeyValue(lockCtx, jetstream.KeyValueConfig{
+		Bucket:  lockName,
+		TTL:     lockTTL,
+		Storage: jetstream.MemoryStorage,
 	})
 
+	kvWatcher, err := kv.Watch(lockCtx, "lock")
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
-	consumer, err := stream.CreateOrUpdateConsumer(lockCtx, jetstream.ConsumerConfig{
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		AckWait:       10 * time.Second,
-		DeliverPolicy: jetstream.DeliverAllPolicy,
-		Durable:       "test",
-	})
+	lockRevision, err := kv.Create(lockCtx, "lock", []byte(ownerId))
 
-	if err != nil {
-		return nil, err
+	// acquire loop
+	for err != nil {
+		// Try to create the lock
+		// Wait for the lock to be released
+		select {
+		case <-lockCtx.Done():
+			// Lock was cancelled
+			return nil, lockCtx.Err()
+		case item := <-kvWatcher.Updates():
+			if item == nil {
+				break
+			}
+			if item.Operation() == jetstream.KeyValueDelete {
+				// Lock was deleted by ttl, so we should wait a bit before trying to create it again.
+				log.Info("Lock deleted by ttl, waiting before trying to create it again")
+				time.Sleep(lockExpireDelay)
+				lockRevision, err = kv.Create(lockCtx, "lock", []byte(ownerId))
+			}
+			if item.Operation() == jetstream.KeyValuePurge {
+				// Lock was purged, so we should try to create it again.
+				lockRevision, err = kv.Create(lockCtx, "lock", []byte(ownerId))
+			}
+		}
 	}
 
-	client.Publish(lockGroup+".lock", []byte("lock"))
-
-	messages, err := consumer.Messages(
-		jetstream.PullMaxMessages(1),
-		jetstream.PullThresholdMessages(1),
-		jetstream.PullHeartbeat(2*time.Second),
-	)
-
-	if err != nil {
-		return nil, err
+	lock := NatsKVLock{
+		client:       client,
+		kv:           kv,
+		LockCtx:      lockCtx,
+		cancel:       cancel,
+		ownerId:      ownerId,
+		lockName:     lockName,
+		lockRevision: lockRevision,
+		kvWatcher:    kvWatcher,
 	}
-
-	msg, err := messages.Next()
-
-	if err != nil {
-		return nil, err
-	}
-
-	lock.lockMsg = msg
 
 	go lock.heartbeat()
-
-	return lock, nil
+	return &lock, nil
 }
 
-func (n *NatsLock) heartbeat() {
+func (l *NatsKVLock) heartbeat() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	defer l.kvWatcher.Stop()
 	for {
 		select {
-		case <-n.LockCtx.Done():
+		case <-l.LockCtx.Done():
 			return
 		case <-ticker.C:
-			err := n.lockMsg.InProgress()
+			rev, err := l.kv.Update(l.LockCtx, "lock", []byte(l.ownerId), l.lockRevision)
 			if err != nil {
-				log.Errorf("Error sending in progress: %s", err)
-				n.Unlock()
+				log.Error("Error updating lock: %s", err)
+				l.Unlock()
+				return
+			}
+			l.lockRevision = rev
+		case item := <-l.kvWatcher.Updates():
+			if item != nil && item.Revision() > l.lockRevision {
+				// Something terrible has happened, we lost the lock
+				log.Error("Lost lock", "item", item)
+				l.Unlock()
+				return
 			}
 		}
 	}
 }
 
-func (n *NatsLock) Unlock() error {
-	err := n.lockMsg.Nak()
-	n.cancel()
+func (l *NatsKVLock) Unlock() error {
+	l.cancel()
+	err := l.kv.Purge(context.Background(), "lock", jetstream.LastRevision(l.lockRevision))
 	if err != nil {
-		log.Errorf("Error acking lock: %s", err)
-		return err
+		log.Error("Error purging lock", "error", err)
+	} else {
+		log.Info("Lock purged")
 	}
-	return nil
+	return err
 }

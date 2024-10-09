@@ -1,14 +1,14 @@
 module pglogicalstream
 
-go 1.22.0
-
-toolchain go1.23.1
+go 1.23.1
 
 require (
 	github.com/charmbracelet/log v0.4.0
 	github.com/cockroachdb/errors v1.11.3
+	github.com/google/uuid v1.6.0
 	github.com/jackc/pglogrepl v0.0.0-20240307033717-828fbfe908e9
 	github.com/jackc/pgx/v5 v5.7.1
+	github.com/nats-io/nats.go v1.37.0
 	github.com/prometheus/client_golang v1.20.4
 	github.com/valyala/fastjson v1.6.4
 )
@@ -20,7 +20,7 @@ require (
 	github.com/charmbracelet/lipgloss v0.10.0 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b // indirect
 	github.com/cockroachdb/redact v1.1.5 // indirect
-	github.com/getsentry/sentry-go v0.27.0 // indirect
+	github.com/getsentry/sentry-go v0.29.0 // indirect
 	github.com/go-logfmt/logfmt v0.6.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/jackc/pgio v1.0.0 // indirect
@@ -35,12 +35,11 @@ require (
 	github.com/muesli/reflow v0.3.0 // indirect
 	github.com/muesli/termenv v0.15.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/nats-io/nats.go v1.37.0 // indirect
 	github.com/nats-io/nkeys v0.4.7 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_model v0.6.1 // indirect
-	github.com/prometheus/common v0.55.0 // indirect
+	github.com/prometheus/common v0.59.1 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/rogpeppe/go-internal v1.12.0 // indirect

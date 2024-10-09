@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/log"
 	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgx/v5"
+	"github.com/nats-io/nats.go" // Import NATS JetStream
 	"github.com/valyala/fastjson"
 )
 
@@ -28,9 +29,13 @@ type Stream struct {
 	logger            *log.Logger
 	failover          bool
 	pluginArguments   map[string]string
-	changeChannel     chan WalChanges
+	changeChannel     chan WalMessage
 	isStreaming       bool
 	lastError         error
+	JS                nats.JetStreamContext
+	KV                nats.KeyValue
+	LockKey           string
+	Owner             string
 }
 
 type PgStreamConfig struct {
@@ -41,22 +46,38 @@ type PgStreamConfig struct {
 	StreamOldData         bool
 	StandbyMessageTimeout time.Duration
 	Tables                []string
-	ChangeChannel         chan WalChanges
+	ChangeChannel         chan WalMessage
+	JS                    nats.JetStreamContext
+	KV                    nats.KeyValue
+}
+
+type WalMessage struct {
+	Error  error
+	Change *WalChanges
 }
 
 type WalChanges struct {
-	Error   error
 	Lsn     pglogrepl.LSN `json:"nextlsn"`
 	Changes []WalChange   `json:"change"`
 }
 
+type KeyType struct {
+	Key  string `json:"key"`
+	Type string `json:"type"`
+}
+
+type KeyValue struct {
+	KeyType
+	Value *interface{} `json:"value"`
+}
+
 type WalChange struct {
-	Kind         string        `json:"kind"`
-	Schema       string        `json:"schema"`
-	Table        string        `json:"table"`
-	ColumnNames  []string      `json:"columnnames"`
-	ColumnTypes  []string      `json:"columntypes"`
-	ColumnValues []interface{} `json:"columnvalues"`
+	Kind   string      `json:"kind"`
+	Schema string      `json:"schema"`
+	Table  string      `json:"table"`
+	New    *[]KeyValue `json:"new"`
+	Old    *[]KeyValue `json:"old"`
+	PK     *[]KeyType  `json:"pk"`
 }
 
 func NewPgStream(ctx context.Context, config PgStreamConfig) (*Stream, error) {
@@ -80,7 +101,9 @@ func NewPgStream(ctx context.Context, config PgStreamConfig) (*Stream, error) {
 		"include-lsn":         "true",
 		"include-transaction": "false",
 		"add-tables":          strings.Join(config.Tables, ","),
+		"include-pk":          "true",
 		"pretty-print":        "false",
+		"actions":             "insert,update,delete,truncate",
 	}
 
 	if len(config.Tables) == 0 {
@@ -97,6 +120,10 @@ func NewPgStream(ctx context.Context, config PgStreamConfig) (*Stream, error) {
 		pgConn:            dbConn.PgConn(),
 		heartbeatInterval: time.Second * 5,
 		changeChannel:     config.ChangeChannel,
+		JS:                config.JS,
+		KV:                config.KV,
+		LockKey:           "pg_logical_stream_lock",
+		Owner:             generateUniqueOwnerID(),
 	}
 	stream.ctx, stream.cancel = context.WithCancel(ctx)
 
@@ -110,18 +137,17 @@ func NewPgStream(ctx context.Context, config PgStreamConfig) (*Stream, error) {
 	var confirmedFlushLSNUnparsed string
 	var consistentPoint string
 	var slotActive bool
-	var slotSynced bool
 	//var snapshotName string
 
-	confirmedFlushResult := dbConn.QueryRow(ctx, fmt.Sprintf("SELECT confirmed_flush_lsn, active, synced FROM pg_replication_slots WHERE slot_name = '%s'", config.SlotName))
-	if err := confirmedFlushResult.Scan(&confirmedFlushLSNUnparsed, &slotActive, &slotSynced); err != nil {
+	confirmedFlushResult := dbConn.QueryRow(ctx, fmt.Sprintf("SELECT confirmed_flush_lsn, active FROM pg_replication_slots WHERE slot_name = '%s'", config.SlotName))
+	if err := confirmedFlushResult.Scan(&confirmedFlushLSNUnparsed, &slotActive); err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.WithDetail(err, "failed to get confirmed flush LSN")
 		}
 
 		logger.Debugf("Replication slot %s does not exist, creating it", config.SlotName)
 
-		// TODO: Support snapshotting
+		// TODO: Support snapshotting (Maybe???)
 		result, err := pglogrepl.CreateReplicationSlot(ctx, stream.pgConn, config.SlotName, "wal2json", pglogrepl.CreateReplicationSlotOptions{})
 
 		if err != nil {
@@ -134,10 +160,6 @@ func NewPgStream(ctx context.Context, config PgStreamConfig) (*Stream, error) {
 		if slotActive {
 			logger.Debugf("Replication slot %s is already active", config.SlotName)
 			return nil, ReplicationSlotInUseError{SlotName: config.SlotName}
-		}
-		if slotSynced {
-			logger.Debugf("Replication slot was synced from a standby and cannot be used for logical replication")
-			return nil, ReplicationSlotSyncedError{SlotName: config.SlotName}
 		}
 		logger.Debugf("Replication slot %s with LSN %s exists, using it", config.SlotName, confirmedFlushLSNUnparsed)
 		consistentPoint = confirmedFlushLSNUnparsed
@@ -205,7 +227,7 @@ func (s *Stream) streamMessagesAsync() {
 
 	sendErrAndStop := func(err error) {
 		s.lastError = err
-		s.changeChannel <- WalChanges{Error: err}
+		s.changeChannel <- WalMessage{Error: err}
 		//s.Stop()
 	}
 
@@ -273,50 +295,64 @@ func (s *Stream) streamMessagesAsync() {
 					Changes: []WalChange{},
 				}
 
+				parseKVs := func(names []*fastjson.Value, types []*fastjson.Value, values []*fastjson.Value) []KeyValue {
+					var kvs []KeyValue
+					for i, name := range names {
+						var value interface{}
+						switch values[i].Type() {
+						case fastjson.TypeNumber:
+							value = values[i].GetFloat64()
+						case fastjson.TypeString:
+							value = string(values[i].GetStringBytes())
+						case fastjson.TypeTrue:
+							value = true
+						case fastjson.TypeFalse:
+							value = false
+						case fastjson.TypeNull:
+							value = nil
+						}
+
+						ref := &value
+						if value == nil {
+							ref = nil
+						}
+
+						kvs = append(kvs, KeyValue{
+							KeyType: KeyType{
+								Key:  string(name.GetStringBytes()),
+								Type: string(types[i].GetStringBytes()),
+							},
+							Value: ref,
+						})
+					}
+					return kvs
+				}
+
 				changesArray := parsed.GetArray("change")
 				for _, change := range changesArray {
+					var newKVs, oldKVs *[]KeyValue
+					if change.Exists("oldkeys") {
+						oldkeys := change.Get("oldkeys")
+						kvArr := parseKVs(oldkeys.GetArray("keynames"), oldkeys.GetArray("keytypes"), oldkeys.GetArray("keyvalues"))
+						oldKVs = &kvArr
+					}
+					if change.Exists("columnnames") && change.Exists("columntypes") && change.Exists("columnvalues") {
+						kvArr := parseKVs(change.GetArray("columnnames"), change.GetArray("columntypes"), change.GetArray("columnvalues"))
+						newKVs = &kvArr
+					}
+
 					changes.Changes = append(changes.Changes, WalChange{
 						Kind:   string(change.GetStringBytes("kind")),
 						Schema: string(change.GetStringBytes("schema")),
 						Table:  string(change.GetStringBytes("table")),
-						ColumnNames: func() []string {
-							var columnNames []string
-							for _, col := range change.GetArray("columnnames") {
-								columnNames = append(columnNames, string(col.GetStringBytes()))
-							}
-							return columnNames
-						}(),
-						ColumnTypes: func() []string {
-							var columnTypes []string
-							for _, col := range change.GetArray("columntypes") {
-								columnTypes = append(columnTypes, string(col.GetStringBytes()))
-							}
-							return columnTypes
-						}(),
-						ColumnValues: func() []interface{} {
-							var columnValues []interface{}
-							for _, col := range change.GetArray("columnvalues") {
-								switch col.Type() {
-								case fastjson.TypeNumber:
-									columnValues = append(columnValues, col.GetFloat64())
-								case fastjson.TypeString:
-									columnValues = append(columnValues, string(col.GetStringBytes()))
-								case fastjson.TypeTrue:
-									columnValues = append(columnValues, true)
-								case fastjson.TypeFalse:
-									columnValues = append(columnValues, false)
-								case fastjson.TypeNull:
-									columnValues = append(columnValues, nil)
-								default:
-									columnValues = append(columnValues, col.String())
-								}
-							}
-							return columnValues
-						}(),
+						New:    newKVs,
+						Old:    oldKVs,
 					})
 				}
 
-				s.changeChannel <- changes
+				s.changeChannel <- WalMessage{Change: &changes}
+			default:
+				s.logger.Warnf("Received unexpected message: %T\n", rawMsg)
 			}
 		}
 	}
@@ -387,4 +423,9 @@ type ReplicationSlotSyncedError struct {
 
 func (e ReplicationSlotSyncedError) Error() string {
 	return fmt.Sprintf("replication slot %s was synced from a standby, and cannot be used for logical replication", e.SlotName)
+}
+
+func generateUniqueOwnerID() string {
+	// Implement a method to generate a unique identifier for the lock owner
+	return fmt.Sprintf("owner-%d", time.Now().UnixNano())
 }
