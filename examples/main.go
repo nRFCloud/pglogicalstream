@@ -186,8 +186,9 @@ func NewNatsKVLock(ctx context.Context, client *nats.Conn, lockName string, lock
 
 	// Create or update the key value store
 	kv, err := js.CreateOrUpdateKeyValue(lockCtx, jetstream.KeyValueConfig{
-		Bucket:  lockName,
-		TTL:     lockTTL,
+		Bucket: lockName,
+		TTL:    lockTTL,
+
 		Storage: jetstream.MemoryStorage,
 	})
 
@@ -240,7 +241,7 @@ func NewNatsKVLock(ctx context.Context, client *nats.Conn, lockName string, lock
 }
 
 func (l *NatsKVLock) heartbeat() {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(50 * time.Second)
 	defer ticker.Stop()
 	defer l.kvWatcher.Stop()
 	for {
@@ -267,8 +268,8 @@ func (l *NatsKVLock) heartbeat() {
 }
 
 func (l *NatsKVLock) Unlock() error {
-	l.cancel()
 	err := l.kv.Purge(context.Background(), "lock", jetstream.LastRevision(l.lockRevision))
+	l.cancel()
 	if err != nil {
 		log.Error("Error purging lock", "error", err)
 	} else {

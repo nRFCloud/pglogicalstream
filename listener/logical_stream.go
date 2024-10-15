@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -12,8 +14,7 @@ import (
 
 	"github.com/charmbracelet/log"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgx/v5"
-	"github.com/nats-io/nats.go" // Import NATS JetStream
+	"github.com/jackc/pgx/v5" // Import NATS JetStream
 	"github.com/valyala/fastjson"
 )
 
@@ -23,19 +24,17 @@ type Stream struct {
 	dbConfig          pgx.ConnConfig
 	ctx               context.Context
 	cancel            context.CancelFunc
-	restartLSN        pglogrepl.LSN
+	restartLSN        atomic.Uint64
 	heartbeatInterval time.Duration
 	slotName          string
 	logger            *log.Logger
 	failover          bool
 	pluginArguments   map[string]string
-	changeChannel     chan WalMessage
+	ChangeChannel     chan WalMessage
 	isStreaming       bool
 	lastError         error
-	JS                nats.JetStreamContext
-	KV                nats.KeyValue
-	LockKey           string
-	Owner             string
+	ackChannel        chan pglogrepl.LSN
+	closeSync         sync.Once
 }
 
 type PgStreamConfig struct {
@@ -47,8 +46,6 @@ type PgStreamConfig struct {
 	StandbyMessageTimeout time.Duration
 	Tables                []string
 	ChangeChannel         chan WalMessage
-	JS                    nats.JetStreamContext
-	KV                    nats.KeyValue
 }
 
 type WalMessage struct {
@@ -119,11 +116,7 @@ func NewPgStream(ctx context.Context, config PgStreamConfig) (*Stream, error) {
 		pluginArguments:   pluginArguments,
 		pgConn:            dbConn.PgConn(),
 		heartbeatInterval: time.Second * 5,
-		changeChannel:     config.ChangeChannel,
-		JS:                config.JS,
-		KV:                config.KV,
-		LockKey:           "pg_logical_stream_lock",
-		Owner:             generateUniqueOwnerID(),
+		ChangeChannel:     config.ChangeChannel,
 	}
 	stream.ctx, stream.cancel = context.WithCancel(ctx)
 
@@ -165,14 +158,15 @@ func NewPgStream(ctx context.Context, config PgStreamConfig) (*Stream, error) {
 		consistentPoint = confirmedFlushLSNUnparsed
 	}
 
-	stream.restartLSN, err = pglogrepl.ParseLSN(consistentPoint)
+	parsedLSN, err := pglogrepl.ParseLSN(consistentPoint)
+	stream.setRestartLSN(parsedLSN)
 	if err != nil {
 		return nil, errors.WithDetail(err, "failed to parse consistent point")
 	}
 
 	err = stream.startLr()
 
-	stream.logger.Info("Started logical replication", "slot_name", config.SlotName, "consistent_point", consistentPoint)
+	stream.logger.Info("Started logical replication", "slot_name", config.SlotName, "consistent_point", stream.restartLSN)
 	if err != nil {
 		return nil, errors.WithDetail(err, "failed to start logical replication")
 	}
@@ -182,6 +176,24 @@ func NewPgStream(ctx context.Context, config PgStreamConfig) (*Stream, error) {
 	return stream, nil
 }
 
+func (s *Stream) GetRestartLSN() pglogrepl.LSN {
+	// load and cast the atomic value to pglogrepl.LSN
+	return pglogrepl.LSN(s.restartLSN.Load())
+}
+
+func (s *Stream) setRestartLSN(lsn pglogrepl.LSN) (prev pglogrepl.LSN, ok bool) {
+	for {
+		prev := pglogrepl.LSN(s.restartLSN.Load())
+		if lsn <= prev {
+			return prev, false
+		}
+
+		if s.restartLSN.CompareAndSwap(uint64(prev), uint64(lsn)) {
+			return prev, true
+		}
+	}
+}
+
 func (s *Stream) sendHeartbeats() {
 	for {
 		select {
@@ -189,7 +201,6 @@ func (s *Stream) sendHeartbeats() {
 			return
 		case <-time.Tick(s.heartbeatInterval):
 			{
-				s.logger.Debug("Sending heartbeat", "lsn", s.restartLSN)
 				err := s.sendStandbyStatus()
 				if err != nil {
 					s.logger.Warn("Failed to send heartbeat", "error", err)
@@ -201,20 +212,18 @@ func (s *Stream) sendHeartbeats() {
 }
 
 func (s *Stream) AckLSN(lsn pglogrepl.LSN) error {
-	s.restartLSN = lsn
-
-	err := pglogrepl.SendStandbyStatusUpdate(s.ctx, s.pgConn, pglogrepl.StandbyStatusUpdate{
-		WALWritePosition: s.restartLSN,
-	})
-	if err != nil {
-		return errors.WithDetail(err, "failed to send standby status")
+	_, ok := s.setRestartLSN(lsn)
+	if !ok {
+		return nil
 	}
-	return nil
+
+	return s.sendStandbyStatus()
 }
 
 func (s *Stream) sendStandbyStatus() error {
+	lsn := s.GetRestartLSN()
 	err := pglogrepl.SendStandbyStatusUpdate(s.ctx, s.pgConn, pglogrepl.StandbyStatusUpdate{
-		WALWritePosition: s.restartLSN,
+		WALWritePosition: lsn,
 	})
 	if err != nil {
 		return errors.WithDetail(err, "failed to send standby status")
@@ -227,8 +236,8 @@ func (s *Stream) streamMessagesAsync() {
 
 	sendErrAndStop := func(err error) {
 		s.lastError = err
-		s.changeChannel <- WalMessage{Error: err}
-		//s.Stop()
+		s.ChangeChannel <- WalMessage{Error: err}
+		s.Stop()
 	}
 
 	for {
@@ -240,6 +249,9 @@ func (s *Stream) streamMessagesAsync() {
 			if err != nil {
 				if pgconn.Timeout(err) {
 					continue
+				}
+				if errors.Is(err, context.Canceled) {
+					return
 				}
 				sendErrAndStop(err)
 				return
@@ -295,21 +307,34 @@ func (s *Stream) streamMessagesAsync() {
 					Changes: []WalChange{},
 				}
 
-				parseKVs := func(names []*fastjson.Value, types []*fastjson.Value, values []*fastjson.Value) []KeyValue {
-					var kvs []KeyValue
+				parseKeyTypes := func(names []*fastjson.Value, types []*fastjson.Value) []KeyType {
+					kts := make([]KeyType, len(names))
 					for i, name := range names {
-						var value interface{}
-						switch values[i].Type() {
-						case fastjson.TypeNumber:
-							value = values[i].GetFloat64()
-						case fastjson.TypeString:
-							value = string(values[i].GetStringBytes())
-						case fastjson.TypeTrue:
-							value = true
-						case fastjson.TypeFalse:
-							value = false
-						case fastjson.TypeNull:
-							value = nil
+						kts[i] = KeyType{
+							Key:  string(name.GetStringBytes()),
+							Type: string(types[i].GetStringBytes()),
+						}
+					}
+					return kts
+				}
+
+				parseKVs := func(names []*fastjson.Value, types []*fastjson.Value, values []*fastjson.Value) []KeyValue {
+					kvs := make([]KeyValue, len(names))
+					for i, name := range names {
+						var value interface{} = nil
+						if values != nil {
+							switch values[i].Type() {
+							case fastjson.TypeNumber:
+								value = values[i].GetFloat64()
+							case fastjson.TypeString:
+								value = string(values[i].GetStringBytes())
+							case fastjson.TypeTrue:
+								value = true
+							case fastjson.TypeFalse:
+								value = false
+							case fastjson.TypeNull:
+								value = nil
+							}
 						}
 
 						ref := &value
@@ -317,13 +342,13 @@ func (s *Stream) streamMessagesAsync() {
 							ref = nil
 						}
 
-						kvs = append(kvs, KeyValue{
+						kvs[i] = KeyValue{
 							KeyType: KeyType{
 								Key:  string(name.GetStringBytes()),
 								Type: string(types[i].GetStringBytes()),
 							},
 							Value: ref,
-						})
+						}
 					}
 					return kvs
 				}
@@ -331,6 +356,7 @@ func (s *Stream) streamMessagesAsync() {
 				changesArray := parsed.GetArray("change")
 				for _, change := range changesArray {
 					var newKVs, oldKVs *[]KeyValue
+					var pks *[]KeyType
 					if change.Exists("oldkeys") {
 						oldkeys := change.Get("oldkeys")
 						kvArr := parseKVs(oldkeys.GetArray("keynames"), oldkeys.GetArray("keytypes"), oldkeys.GetArray("keyvalues"))
@@ -340,6 +366,11 @@ func (s *Stream) streamMessagesAsync() {
 						kvArr := parseKVs(change.GetArray("columnnames"), change.GetArray("columntypes"), change.GetArray("columnvalues"))
 						newKVs = &kvArr
 					}
+					if change.Exists("pk") {
+						pk := change.Get("pk")
+						pkArr := parseKeyTypes(pk.GetArray("pknames"), pk.GetArray("pktypes"))
+						pks = &pkArr
+					}
 
 					changes.Changes = append(changes.Changes, WalChange{
 						Kind:   string(change.GetStringBytes("kind")),
@@ -347,10 +378,11 @@ func (s *Stream) streamMessagesAsync() {
 						Table:  string(change.GetStringBytes("table")),
 						New:    newKVs,
 						Old:    oldKVs,
+						PK:     pks,
 					})
 				}
 
-				s.changeChannel <- WalMessage{Change: &changes}
+				s.ChangeChannel <- WalMessage{Change: &changes}
 			default:
 				s.logger.Warnf("Received unexpected message: %T\n", rawMsg)
 			}
@@ -363,7 +395,7 @@ func (s *Stream) startLr() error {
 	for k, v := range s.pluginArguments {
 		pluginArgumentsArr = append(pluginArgumentsArr, fmt.Sprintf("\"%s\" '%s'", k, v))
 	}
-	err := pglogrepl.StartReplication(s.ctx, s.pgConn, s.slotName, s.restartLSN, pglogrepl.StartReplicationOptions{
+	err := pglogrepl.StartReplication(s.ctx, s.pgConn, s.slotName, s.GetRestartLSN(), pglogrepl.StartReplicationOptions{
 		PluginArgs: pluginArgumentsArr,
 	})
 	if err != nil {
@@ -377,36 +409,27 @@ func (s *Stream) IsStreaming() bool {
 	return s.isStreaming
 }
 
-func (s *Stream) Stop() error {
-	// Send the last LSN to the server
-	s.AckLSN(s.restartLSN)
+func (s *Stream) Stop() (err error) {
+	s.closeSync.Do(func() {
+		// Send the last LSN to the server
+		s.sendStandbyStatus()
 
-	s.cancel() // Cancel the context to stop goroutines
-	s.isStreaming = false
+		s.cancel() // Cancel the context to stop goroutines
+		s.isStreaming = false
 
-	// Drain the change channel
-	draining := true
-	for draining {
-		select {
-		case _, ok := <-s.changeChannel:
-			if !ok {
-				// Channel is closed, we're done draining
-				draining = false
-			}
-		default:
-			// Channel is empty, we're done draining
-			close(s.changeChannel)
-			draining = false
+		// Drain the change channel
+		for range s.ChangeChannel {
 		}
-	}
 
-	// Close the database connection
-	if err := s.dbConn.Close(context.Background()); err != nil {
-		return errors.Wrap(err, "failed to close database connection")
-	}
+		// Close the database connection
+		if err = s.dbConn.Close(context.Background()); err != nil {
+			err = errors.Wrap(err, "failed to close database connection")
+		}
 
-	s.logger.Info("Logical replication stream stopped")
-	return nil
+		s.logger.Info("Logical replication stream stopped")
+		close(s.ChangeChannel)
+	})
+	return
 }
 
 type ReplicationSlotInUseError struct {
@@ -423,9 +446,4 @@ type ReplicationSlotSyncedError struct {
 
 func (e ReplicationSlotSyncedError) Error() string {
 	return fmt.Sprintf("replication slot %s was synced from a standby, and cannot be used for logical replication", e.SlotName)
-}
-
-func generateUniqueOwnerID() string {
-	// Implement a method to generate a unique identifier for the lock owner
-	return fmt.Sprintf("owner-%d", time.Now().UnixNano())
 }
