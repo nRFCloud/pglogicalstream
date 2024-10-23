@@ -1,0 +1,14 @@
+input:
+  nats_jetstream:
+    urls:
+      - nats://default-nats-cluster.brumby-dragon.ts.net:4222
+    stream: pg_cdc
+    subject: pg_cdc.device
+    bind: false
+    durable: pg_csv
+    queue: pg_csv
+
+output:
+  stdout: {}
+
+ 

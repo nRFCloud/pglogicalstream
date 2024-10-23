@@ -3,6 +3,7 @@ package listener
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,7 @@ type Stream struct {
 	cancel            context.CancelFunc
 	restartLSN        atomic.Uint64
 	heartbeatInterval time.Duration
+	probeInterval     time.Duration
 	slotName          string
 	logger            *log.Logger
 	failover          bool
@@ -35,6 +37,7 @@ type Stream struct {
 	lastError         error
 	ackChannel        chan pglogrepl.LSN
 	closeSync         sync.Once
+	probeConn         *pgx.Conn
 }
 
 type PgStreamConfig struct {
@@ -46,6 +49,8 @@ type PgStreamConfig struct {
 	StandbyMessageTimeout time.Duration
 	Tables                []string
 	ChangeChannel         chan WalMessage
+	MaxWaitForSlot        time.Duration
+	SlotCheckInterval     time.Duration
 }
 
 type WalMessage struct {
@@ -77,15 +82,34 @@ type WalChange struct {
 	PK     *[]KeyType  `json:"pk"`
 }
 
-func NewPgStream(ctx context.Context, config PgStreamConfig) (*Stream, error) {
-	// Set replication=database to enable logical replication
-	if config.DbConfig.RuntimeParams == nil {
-		config.DbConfig.RuntimeParams = make(map[string]string)
-	}
-	config.DbConfig.RuntimeParams["replication"] = "database"
-	config.DbConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+func verifyPrimary(ctx context.Context, dbConn *pgx.Conn) (sysId string, isInRecovery bool, err error) {
+	err = dbConn.QueryRow(ctx, "SELECT system_identifier, pg_is_in_recovery() FROM pg_control_system()").Scan(&sysId, &isInRecovery)
+	return
+}
 
-	dbConn, err := pgx.ConnectConfig(ctx, &config.DbConfig)
+func NewPgStream(ctx context.Context, config PgStreamConfig) (stream *Stream, err error) {
+	ctx, cancel := context.WithCancel(ctx)
+
+	defer func() {
+		if err != nil {
+			cancel()
+		}
+	}()
+	// Set replication=database to enable logical replication
+	probeConnConfig := config.DbConfig.Copy()
+	probeConn, err := pgx.ConnectConfig(ctx, probeConnConfig)
+	if err != nil {
+		return nil, errors.WithDetail(err, "failed to connect probe connection")
+	}
+
+	dbConfig := config.DbConfig.Copy()
+	if dbConfig.RuntimeParams == nil {
+		dbConfig.RuntimeParams = make(map[string]string)
+	}
+	dbConfig.RuntimeParams["replication"] = "database"
+	dbConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+
+	dbConn, err := pgx.ConnectConfig(ctx, dbConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -107,18 +131,26 @@ func NewPgStream(ctx context.Context, config PgStreamConfig) (*Stream, error) {
 		return nil, errors.New("no tables specified")
 	}
 
-	stream := &Stream{
+	stream = &Stream{
 		dbConn:            dbConn,
 		dbConfig:          config.DbConfig,
 		slotName:          config.SlotName,
 		logger:            logger,
+		probeConn:         probeConn,
 		failover:          config.Failover,
+		probeInterval:     time.Second * 5,
 		pluginArguments:   pluginArguments,
 		pgConn:            dbConn.PgConn(),
 		heartbeatInterval: time.Second * 5,
 		ChangeChannel:     config.ChangeChannel,
+		ctx:               ctx,
+		cancel:            cancel,
 	}
-	stream.ctx, stream.cancel = context.WithCancel(ctx)
+
+	// Set default values if not provided
+	if config.SlotCheckInterval == 0 {
+		config.SlotCheckInterval = 5 * time.Second
+	}
 
 	sysident, err := pglogrepl.IdentifySystem(ctx, stream.pgConn)
 	if err != nil {
@@ -127,35 +159,57 @@ func NewPgStream(ctx context.Context, config PgStreamConfig) (*Stream, error) {
 
 	logger.Debugf("System identifier: %s, timeline: %d, xlogpos: %d, dbname: %s", sysident.SystemID, sysident.Timeline, sysident.XLogPos, sysident.DBName)
 
+	// Verify that both connections are connected to the same node and that we are connected to a primary
+	// IDENTIFY_SYSTEM will NOT work on our probe connection, so we need to use the dbConn to verify that we are connected to a primary
+	// select system_identifier, pg_is_in_recovery from pg_control_system(), pg_is_in_recovery();
+	dbConnSysId, dbConnIsInRecovery, err := verifyPrimary(ctx, dbConn)
+	if err != nil {
+		return nil, errors.WithDetail(err, "failed to verify that we are connected to a primary")
+	}
+	probeConnSysId, probeConnIsInRecovery, err := verifyPrimary(ctx, probeConn)
+	if err != nil {
+		return nil, errors.WithDetail(err, "failed to verify that we are connected to a primary")
+	}
+
+	if dbConnSysId != probeConnSysId {
+		return nil, errors.New("database connections are connected to different nodes")
+	}
+
+	if dbConnIsInRecovery || probeConnIsInRecovery {
+		return nil, errors.New("Logical replication is not supported on standby nodes, aborting WAL stream")
+	}
+
 	var confirmedFlushLSNUnparsed string
 	var consistentPoint string
 	var slotActive bool
-	//var snapshotName string
+	var slotPlugin string
 
-	confirmedFlushResult := dbConn.QueryRow(ctx, fmt.Sprintf("SELECT confirmed_flush_lsn, active FROM pg_replication_slots WHERE slot_name = '%s'", config.SlotName))
-	if err := confirmedFlushResult.Scan(&confirmedFlushLSNUnparsed, &slotActive); err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
+	for {
+		confirmedFlushResult := dbConn.QueryRow(ctx, fmt.Sprintf("SELECT confirmed_flush_lsn, active, plugin FROM pg_replication_slots WHERE slot_name = '%s'", config.SlotName))
+		err := confirmedFlushResult.Scan(&confirmedFlushLSNUnparsed, &slotActive, &slotPlugin)
+
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				logger.Debugf("Replication slot %s does not exist, creating it", config.SlotName)
+				result, err := pglogrepl.CreateReplicationSlot(ctx, stream.pgConn, config.SlotName, "wal2json", pglogrepl.CreateReplicationSlotOptions{})
+				if err != nil {
+					return nil, errors.WithDetail(err, "failed to create logical replication slot")
+				}
+				consistentPoint = result.ConsistentPoint
+				break
+			}
 			return nil, errors.WithDetail(err, "failed to get confirmed flush LSN")
 		}
 
-		logger.Debugf("Replication slot %s does not exist, creating it", config.SlotName)
-
-		// TODO: Support snapshotting (Maybe???)
-		result, err := pglogrepl.CreateReplicationSlot(ctx, stream.pgConn, config.SlotName, "wal2json", pglogrepl.CreateReplicationSlotOptions{})
-
-		if err != nil {
-			return nil, errors.WithDetail(err, "failed to create logical replication slot")
+		if !slotActive {
+			logger.Debugf("Replication slot %s exists and is inactive, using it", config.SlotName)
+			consistentPoint = confirmedFlushLSNUnparsed
+			break
 		}
 
-		consistentPoint = result.ConsistentPoint
-		//snapshotName = result.SnapshotName
-	} else {
-		if slotActive {
-			logger.Debugf("Replication slot %s is already active", config.SlotName)
-			return nil, ReplicationSlotInUseError{SlotName: config.SlotName}
+		if slotPlugin != "wal2json" {
+			return nil, ReplicationSlotPluginMismatchError{SlotName: config.SlotName, ExpectedPlugin: "wal2json", ActualPlugin: slotPlugin}
 		}
-		logger.Debugf("Replication slot %s with LSN %s exists, using it", config.SlotName, confirmedFlushLSNUnparsed)
-		consistentPoint = confirmedFlushLSNUnparsed
 	}
 
 	parsedLSN, err := pglogrepl.ParseLSN(consistentPoint)
@@ -164,16 +218,63 @@ func NewPgStream(ctx context.Context, config PgStreamConfig) (*Stream, error) {
 		return nil, errors.WithDetail(err, "failed to parse consistent point")
 	}
 
-	err = stream.startLr()
-
-	stream.logger.Info("Started logical replication", "slot_name", config.SlotName, "consistent_point", stream.restartLSN)
-	if err != nil {
-		return nil, errors.WithDetail(err, "failed to start logical replication")
-	}
-	go stream.sendHeartbeats()
-	go stream.streamMessagesAsync()
+	go stream.startLr()
 
 	return stream, nil
+}
+
+func (s *Stream) startLr() error {
+	var pluginArgumentsArr []string
+	for k, v := range s.pluginArguments {
+		pluginArgumentsArr = append(pluginArgumentsArr, fmt.Sprintf("\"%s\" '%s'", k, v))
+	}
+	acquired := false
+
+	for !acquired {
+		select {
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		default:
+			s.logger.Info("Waiting for slot to become inactive...")
+
+			err := pglogrepl.StartReplication(s.ctx, s.pgConn, s.slotName, s.GetRestartLSN(), pglogrepl.StartReplicationOptions{
+				PluginArgs: pluginArgumentsArr,
+			})
+
+			if err != nil {
+				// If the slot is in use, we need to wait for it to become inactive
+				if errors.Is(err, pgx.ErrTxClosed) {
+					s.logger.Errorf("Replication slot %s is in use, retrying", s.slotName, "error", err)
+
+					// Generate a random jitter between 0 and 100ms
+					jitter := rand.Intn(100)
+
+					select {
+					case <-s.ctx.Done():
+						return s.ctx.Err()
+					case <-time.After(100*time.Millisecond + time.Duration(jitter)*time.Millisecond):
+						continue
+					}
+				}
+
+				// Send error and stop
+				s.lastError = err
+				s.ChangeChannel <- WalMessage{Error: err}
+				s.Stop()
+				return err
+			}
+
+			acquired = true
+		}
+	}
+
+	s.logger.Info("Replication slot is now inactive, starting to stream messages", "slot_name", s.slotName)
+
+	s.isStreaming = true
+	go s.sendHeartbeats()
+	go s.streamMessagesAsync()
+	go s.probePrimary()
+	return nil
 }
 
 func (s *Stream) GetRestartLSN() pglogrepl.LSN {
@@ -207,7 +308,26 @@ func (s *Stream) sendHeartbeats() {
 				}
 			}
 		}
+	}
+}
 
+func (s *Stream) probePrimary() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.Tick(s.probeInterval):
+			_, isInRecovery, err := verifyPrimary(s.ctx, s.probeConn)
+			if err != nil {
+				s.logger.Warn("Failed to probe connection", "error", err)
+				s.Stop()
+				return
+			}
+			if isInRecovery {
+				s.logger.Warn("Probing connection to primary failed, stopping stream", "slot_name", s.slotName)
+				s.Stop()
+			}
+		}
 	}
 }
 
@@ -236,7 +356,6 @@ func (s *Stream) streamMessagesAsync() {
 
 	sendErrAndStop := func(err error) {
 		s.lastError = err
-		s.ChangeChannel <- WalMessage{Error: err}
 		s.Stop()
 	}
 
@@ -248,6 +367,7 @@ func (s *Stream) streamMessagesAsync() {
 			rawMsg, err := s.pgConn.ReceiveMessage(s.ctx)
 			if err != nil {
 				if pgconn.Timeout(err) {
+					s.logger.Warn("Timeout receiving message, continuing", "error", err)
 					continue
 				}
 				if errors.Is(err, context.Canceled) {
@@ -262,10 +382,16 @@ func (s *Stream) streamMessagesAsync() {
 				return
 			}
 
+			if _, ok := rawMsg.(*pgproto3.CommandComplete); ok {
+				sendErrAndStop(errors.New("Stream ended prematurely"))
+				return
+			}
+
 			msg, ok := rawMsg.(*pgproto3.CopyData)
 			if !ok {
-				s.logger.Warnf("Received unexpected message: %T\n", rawMsg)
-				continue
+				// s.logger.Warnf("Received unexpected message: %T\n", rawMsg)
+				sendErrAndStop(errors.New("Received unexpected message"))
+				return
 			}
 
 			switch msg.Data[0] {
@@ -385,28 +511,35 @@ func (s *Stream) streamMessagesAsync() {
 				s.ChangeChannel <- WalMessage{Change: &changes}
 			default:
 				s.logger.Warnf("Received unexpected message: %T\n", rawMsg)
+				//sendErrAndStop(errors.New("Received unexpected message"))
+				return
 			}
 		}
 	}
 }
 
-func (s *Stream) startLr() error {
-	var pluginArgumentsArr []string
-	for k, v := range s.pluginArguments {
-		pluginArgumentsArr = append(pluginArgumentsArr, fmt.Sprintf("\"%s\" '%s'", k, v))
-	}
-	err := pglogrepl.StartReplication(s.ctx, s.pgConn, s.slotName, s.GetRestartLSN(), pglogrepl.StartReplicationOptions{
-		PluginArgs: pluginArgumentsArr,
-	})
-	if err != nil {
-		return errors.WithDetail(err, "failed to start replication")
-	}
-	s.isStreaming = true
-	return nil
-}
-
 func (s *Stream) IsStreaming() bool {
 	return s.isStreaming
+}
+
+func (s *Stream) closeConnections() (err error) {
+	if s.dbConn != nil {
+		if err = s.dbConn.Close(context.Background()); err != nil {
+			err = errors.Wrap(err, "failed to close database connection")
+		}
+	}
+
+	if s.probeConn != nil {
+		if err = s.probeConn.Close(context.Background()); err != nil {
+			err = errors.Wrap(err, "failed to close probe connection")
+		}
+	}
+
+	return
+}
+
+func (s *Stream) GetLastError() error {
+	return s.lastError
 }
 
 func (s *Stream) Stop() (err error) {
@@ -417,13 +550,9 @@ func (s *Stream) Stop() (err error) {
 		s.cancel() // Cancel the context to stop goroutines
 		s.isStreaming = false
 
-		// Drain the change channel
-		for range s.ChangeChannel {
-		}
-
 		// Close the database connection
-		if err = s.dbConn.Close(context.Background()); err != nil {
-			err = errors.Wrap(err, "failed to close database connection")
+		if err = s.closeConnections(); err != nil {
+			err = errors.Wrap(err, "failed to close connections")
 		}
 
 		s.logger.Info("Logical replication stream stopped")
@@ -446,4 +575,14 @@ type ReplicationSlotSyncedError struct {
 
 func (e ReplicationSlotSyncedError) Error() string {
 	return fmt.Sprintf("replication slot %s was synced from a standby, and cannot be used for logical replication", e.SlotName)
+}
+
+type ReplicationSlotPluginMismatchError struct {
+	SlotName       string
+	ExpectedPlugin string
+	ActualPlugin   string
+}
+
+func (e ReplicationSlotPluginMismatchError) Error() string {
+	return fmt.Sprintf("replication slot %s is using plugin %s, expected plugin %s", e.SlotName, e.ActualPlugin, e.ExpectedPlugin)
 }

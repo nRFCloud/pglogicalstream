@@ -17,7 +17,6 @@ package benthos
 import (
 	"context"
 	"pglogicalstream/listener"
-	"sync"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -35,12 +34,12 @@ func (c *closureOffsetTracker) MarkOffset(offset pglogrepl.LSN) {
 
 func (k *pgWalReader) runPartitionConsumer(
 	ctx context.Context,
-	wg *sync.WaitGroup,
 	listener *listener.Stream,
+	deathChan chan struct{},
 ) {
 	k.mgr.Logger().Debugf("Consuming messages from wal log\n")
 	defer k.mgr.Logger().Debugf("Stopped consuming messages from wal log\n")
-	defer wg.Done()
+	defer close(deathChan)
 
 	batchPolicy, err := k.batching.NewBatcher(k.mgr)
 	if err != nil {
@@ -115,9 +114,8 @@ partMsgLoop:
 			break partMsgLoop
 		}
 	}
-	// Drain everything that's left.
-	for range listener.ChangeChannel {
-	}
+
+	k.mgr.Logger().Errorf("Consumer has been closed")
 }
 
 func (k *pgWalReader) connectExplicitTopics(ctx context.Context, streamConfig *listener.PgStreamConfig) (err error) {
@@ -132,11 +130,10 @@ func (k *pgWalReader) connectExplicitTopics(ctx context.Context, streamConfig *l
 		}
 	}()
 
-	if consumer, err = listener.NewPgStream(ctx, *streamConfig); err != nil {
+	if consumer, err = listener.NewPgStream(context.Background(), *streamConfig); err != nil {
 		return err
 	}
 
-	consumerWG := sync.WaitGroup{}
 	msgChan := make(chan asyncMessage)
 	ctx, doneFn := context.WithCancel(context.Background())
 	currentLSN := consumer.GetRestartLSN()
@@ -147,8 +144,8 @@ func (k *pgWalReader) connectExplicitTopics(ctx context.Context, streamConfig *l
 		},
 	}
 
-	consumerWG.Add(1)
-	go k.runPartitionConsumer(ctx, &consumerWG, consumer)
+	deathChan := make(chan struct{})
+	go k.runPartitionConsumer(ctx, consumer, deathChan)
 
 	// for topic, partitions := range k.topicPartitions {
 	// 	for _, partition := range partitions {
@@ -201,6 +198,8 @@ func (k *pgWalReader) connectExplicitTopics(ctx context.Context, streamConfig *l
 			select {
 			case <-ctx.Done():
 				looping = false
+			case <-deathChan:
+				looping = false
 			case <-time.After(k.commitPeriod):
 			}
 			k.cMut.Lock()
@@ -208,15 +207,18 @@ func (k *pgWalReader) connectExplicitTopics(ctx context.Context, streamConfig *l
 			k.cMut.Unlock()
 			if err := consumer.AckLSN(putLSN); err != nil {
 				k.mgr.Logger().Errorf("Failed to commit LSN: %v\n", err)
+				looping = false
 			}
 		}
-		k.mgr.Logger().Debugf("Commit loop stopped\n")
 		consumer.Stop()
-		consumerWG.Done()
-
+		if consumer.GetLastError() != nil {
+			k.mgr.Logger().Errorf("Consumer stopped with error: %v\n", consumer.GetLastError())
+		}
+		k.mgr.Logger().Debugf("Commit loop stopped\n")
 		k.cMut.Lock()
 		if k.msgChan != nil {
 			close(k.msgChan)
+
 			k.msgChan = nil
 		}
 		k.cMut.Unlock()

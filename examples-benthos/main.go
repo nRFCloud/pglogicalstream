@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
-	"github.com/redpanda-data/connect/v4/public/service"
 	"os"
 	"os/signal"
 	_ "pglogicalstream/benthos"
 	"syscall"
 
-	// Import full suite of FOSS connect plugins
+	"github.com/redpanda-data/benthos/v4/public/service"
+
 	_ "github.com/redpanda-data/connect/public/bundle/free/v4"
 )
 
@@ -27,6 +27,7 @@ func RegisterShutdownHook() *ShutdownHook {
 	hook := &ShutdownHook{
 		done: make(chan bool, 1),
 	}
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
@@ -48,20 +49,21 @@ func (s *ShutdownHook) WaitForExit() {
 var DefaultShutdownHook = RegisterShutdownHook()
 
 func main() {
-	service.RunCLI(context.Background())
+	// service.RunCLI(context.Background())
 
 	builder := service.NewStreamBuilder()
 
 	err := builder.AddInputYAML(
 		`
 pg_wal:
-  dsn: "postgres://john:eGqpHPBXAPkNBrTovdMWwXghhht4g0SfrqdJmzmzmotOGCAFEAZqi7NA4Fv4Txhl@default-best-cluster.brumby-dragon.ts.net/postgres"
+  dsn: "postgres://john:letmein@default-best-cluster-svc.brumby-dragon.ts.net/postgres"
   tables:
     - "public.device"
   slot: "test_slot_4"
   checkpoint_limit: 1
   commit_period: 1s
   auto_replay_nacks: true
+  failover: true
   batching:
     count: 10
     period: 10s

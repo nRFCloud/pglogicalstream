@@ -1,0 +1,16 @@
+{
+  "transforms": [
+    {
+      "mode": "sql",
+      "include": "**/*.sql",
+      "emitTemplate": "{{dir}}/{{name}}.types.ts"
+    }
+  ],
+  "srcDir": "queries",
+  "dbUrl": "postgres://john:INhxFuCiip97zgPUngfSt1u74ojsc8g2NaUO2DXNUM81IEJxbjo0iC7uZexZKvny@default-location-service-cluster.brumby-dragon.ts.net/postgres?sslmode=require",
+  "db": {
+    "ssl": {
+      "rejectUnauthorized": false
+    }
+  }
+}

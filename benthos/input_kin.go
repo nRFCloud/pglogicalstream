@@ -37,6 +37,7 @@ const (
 	iskFieldCheckpointLimit = "checkpoint_limit"
 	iskFieldCommitPeriod    = "commit_period"
 	iskFieldBatching        = "batching"
+	iskFieldFailover        = "failover"
 )
 
 func pgwalConfigSpec() *service.ConfigSpec {
@@ -57,6 +58,8 @@ func pgwalConfigSpec() *service.ConfigSpec {
 		service.NewDurationField("commit_period").
 			Description("The period at which to commit the offset."),
 		service.NewBatchPolicyField(iskFieldBatching).Advanced(),
+		service.NewBoolField("failover").
+			Description("Whether to enable slot failover (PG >=17)."),
 	)
 }
 
@@ -105,7 +108,8 @@ type pgWalReader struct {
 	msgChan         chan asyncMessage
 	session         offsetMarker
 
-	mgr *service.Resources
+	failover bool
+	mgr      *service.Resources
 
 	closeOnce  sync.Once
 	closedChan chan struct{}
@@ -155,10 +159,15 @@ func newPGWalReaderFromParsed(conf *service.ParsedConfig, mgr *service.Resources
 		return nil, err
 	}
 
+	if k.failover, err = conf.FieldBool(iskFieldFailover); err != nil {
+		return nil, err
+	}
+
 	k.listenerConfig = &listener.PgStreamConfig{
 		SlotName: k.slotName,
 		Tables:   tables,
 		DbConfig: *k.pgConnConfig,
+		Failover: k.failover,
 		BaseLogger: log.NewWithOptions(os.Stdout, log.Options{
 			Level:        log.DebugLevel,
 			ReportCaller: true,
@@ -307,13 +316,14 @@ func (k *pgWalReader) ReadBatch(ctx context.Context) (service.MessageBatch, serv
 	select {
 	case m, open := <-msgChan:
 		if !open {
+			k.mgr.Logger().Warn("Message channel closed, returning ErrNotConnected")
 			return nil, nil, service.ErrNotConnected
 		}
 		k.mgr.Logger().Tracef("Benthos read batch from pgwal")
 		return m.msg, m.ackFn, nil
 	case <-ctx.Done():
+		return nil, nil, ctx.Err()
 	}
-	return nil, nil, ctx.Err()
 }
 
 func (k *pgWalReader) Close(ctx context.Context) (err error) {
