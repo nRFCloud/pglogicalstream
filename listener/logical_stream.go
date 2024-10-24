@@ -32,7 +32,7 @@ type Stream struct {
 	logger            *log.Logger
 	failover          bool
 	pluginArguments   map[string]string
-	ChangeChannel     chan WalMessage
+	ChangeChannel     chan WalChange
 	isStreaming       bool
 	lastError         error
 	ackChannel        chan pglogrepl.LSN
@@ -48,38 +48,9 @@ type PgStreamConfig struct {
 	StreamOldData         bool
 	StandbyMessageTimeout time.Duration
 	Tables                []string
-	ChangeChannel         chan WalMessage
+	ChangeChannel         chan WalChange
 	MaxWaitForSlot        time.Duration
 	SlotCheckInterval     time.Duration
-}
-
-type WalMessage struct {
-	Error  error
-	Change *WalChanges
-}
-
-type WalChanges struct {
-	Lsn     pglogrepl.LSN `json:"nextlsn"`
-	Changes []WalChange   `json:"change"`
-}
-
-type KeyType struct {
-	Key  string `json:"key"`
-	Type string `json:"type"`
-}
-
-type KeyValue struct {
-	KeyType
-	Value *interface{} `json:"value"`
-}
-
-type WalChange struct {
-	Kind   string      `json:"kind"`
-	Schema string      `json:"schema"`
-	Table  string      `json:"table"`
-	New    *[]KeyValue `json:"new"`
-	Old    *[]KeyValue `json:"old"`
-	PK     *[]KeyType  `json:"pk"`
 }
 
 func verifyPrimary(ctx context.Context, dbConn *pgx.Conn) (sysId string, isInRecovery bool, err error) {
@@ -117,13 +88,14 @@ func NewPgStream(ctx context.Context, config PgStreamConfig) (stream *Stream, er
 	logger := config.BaseLogger.WithPrefix("pglogical")
 
 	pluginArguments := map[string]string{
-		//"write-in-chunks":     "true",
+		"format-version":      "2",
 		"include-xids":        "true",
+		"include-transaction": "true",
 		"include-lsn":         "true",
-		"include-transaction": "false",
 		"add-tables":          strings.Join(config.Tables, ","),
 		"include-pk":          "true",
 		"pretty-print":        "false",
+		"include-timestamp":   "true",
 		"actions":             "insert,update,delete,truncate",
 	}
 
@@ -259,7 +231,6 @@ func (s *Stream) startLr() error {
 
 				// Send error and stop
 				s.lastError = err
-				s.ChangeChannel <- WalMessage{Error: err}
 				s.Stop()
 				return err
 			}
@@ -389,7 +360,6 @@ func (s *Stream) streamMessagesAsync() {
 
 			msg, ok := rawMsg.(*pgproto3.CopyData)
 			if !ok {
-				// s.logger.Warnf("Received unexpected message: %T\n", rawMsg)
 				sendErrAndStop(errors.New("Received unexpected message"))
 				return
 			}
@@ -420,98 +390,16 @@ func (s *Stream) streamMessagesAsync() {
 					sendErrAndStop(errors.WithDetail(err, "failed to parse WAL data"))
 					return
 				}
-				unparsedLsn := string(parsed.GetStringBytes("nextlsn"))
-				parsedLsn, err := pglogrepl.ParseLSN(unparsedLsn)
 
+				change, err := ParseWalChange(parsed)
 				if err != nil {
-					sendErrAndStop(errors.WithDetail(err, "failed to parse next LSN"))
+					sendErrAndStop(err)
 					return
 				}
 
-				changes := WalChanges{
-					Lsn:     parsedLsn,
-					Changes: []WalChange{},
-				}
-
-				parseKeyTypes := func(names []*fastjson.Value, types []*fastjson.Value) []KeyType {
-					kts := make([]KeyType, len(names))
-					for i, name := range names {
-						kts[i] = KeyType{
-							Key:  string(name.GetStringBytes()),
-							Type: string(types[i].GetStringBytes()),
-						}
-					}
-					return kts
-				}
-
-				parseKVs := func(names []*fastjson.Value, types []*fastjson.Value, values []*fastjson.Value) []KeyValue {
-					kvs := make([]KeyValue, len(names))
-					for i, name := range names {
-						var value interface{} = nil
-						if values != nil {
-							switch values[i].Type() {
-							case fastjson.TypeNumber:
-								value = values[i].GetFloat64()
-							case fastjson.TypeString:
-								value = string(values[i].GetStringBytes())
-							case fastjson.TypeTrue:
-								value = true
-							case fastjson.TypeFalse:
-								value = false
-							case fastjson.TypeNull:
-								value = nil
-							}
-						}
-
-						ref := &value
-						if value == nil {
-							ref = nil
-						}
-
-						kvs[i] = KeyValue{
-							KeyType: KeyType{
-								Key:  string(name.GetStringBytes()),
-								Type: string(types[i].GetStringBytes()),
-							},
-							Value: ref,
-						}
-					}
-					return kvs
-				}
-
-				changesArray := parsed.GetArray("change")
-				for _, change := range changesArray {
-					var newKVs, oldKVs *[]KeyValue
-					var pks *[]KeyType
-					if change.Exists("oldkeys") {
-						oldkeys := change.Get("oldkeys")
-						kvArr := parseKVs(oldkeys.GetArray("keynames"), oldkeys.GetArray("keytypes"), oldkeys.GetArray("keyvalues"))
-						oldKVs = &kvArr
-					}
-					if change.Exists("columnnames") && change.Exists("columntypes") && change.Exists("columnvalues") {
-						kvArr := parseKVs(change.GetArray("columnnames"), change.GetArray("columntypes"), change.GetArray("columnvalues"))
-						newKVs = &kvArr
-					}
-					if change.Exists("pk") {
-						pk := change.Get("pk")
-						pkArr := parseKeyTypes(pk.GetArray("pknames"), pk.GetArray("pktypes"))
-						pks = &pkArr
-					}
-
-					changes.Changes = append(changes.Changes, WalChange{
-						Kind:   string(change.GetStringBytes("kind")),
-						Schema: string(change.GetStringBytes("schema")),
-						Table:  string(change.GetStringBytes("table")),
-						New:    newKVs,
-						Old:    oldKVs,
-						PK:     pks,
-					})
-				}
-
-				s.ChangeChannel <- WalMessage{Change: &changes}
+				s.ChangeChannel <- change
 			default:
 				s.logger.Warnf("Received unexpected message: %T\n", rawMsg)
-				//sendErrAndStop(errors.New("Received unexpected message"))
 				return
 			}
 		}

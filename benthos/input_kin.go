@@ -262,13 +262,41 @@ func (k *pgWalReader) syncCheckpointer() func(context.Context, chan<- asyncMessa
 	}
 }
 
-func dataToPart(lsn pglogrepl.LSN, data *listener.WalChange) *service.Message {
-	part := service.NewMessage(nil)
-	part.SetStructured(data)
+func dataToPart(data *listener.WalChange) *service.Message {
+	// If we receive a Begin or Commit, don't build a message
+	dataRef := *data
+	switch dataRef.(type) {
+	case *listener.WalChangeBegin:
+		return nil
+	case *listener.WalChangeCommit:
+		return nil
+	}
 
-	part.MetaSetMut("lsn", lsn.String())
-	part.MetaSetMut("table", data.Table)
-	part.MetaSetMut("schema", data.Schema)
+	part := service.NewMessage(nil)
+	part.SetStructuredMut(dataRef)
+
+	switch v := dataRef.(type) {
+	case *listener.WalChangeInsert:
+		part.MetaSetMut("lsn", v.LSN)
+		part.MetaSetMut("table", v.Table)
+		part.MetaSetMut("schema", v.Schema)
+		part.MetaSetMut("action", string(v.Action))
+	case *listener.WalChangeUpdate:
+		part.MetaSetMut("lsn", v.LSN)
+		part.MetaSetMut("table", v.Table)
+		part.MetaSetMut("schema", v.Schema)
+		part.MetaSetMut("action", string(v.Action))
+	case *listener.WalChangeDelete:
+		part.MetaSetMut("lsn", v.LSN)
+		part.MetaSetMut("table", v.Table)
+		part.MetaSetMut("schema", v.Schema)
+		part.MetaSetMut("action", string(v.Action))
+	case *listener.WalChangeTruncate:
+		part.MetaSetMut("lsn", v.LSN)
+		part.MetaSetMut("table", v.Table)
+		part.MetaSetMut("schema", v.Schema)
+		part.MetaSetMut("action", string(v.Action))
+	}
 
 	return part
 }

@@ -34,18 +34,18 @@ func (c *closureOffsetTracker) MarkOffset(offset pglogrepl.LSN) {
 
 func (k *pgWalReader) runPartitionConsumer(
 	ctx context.Context,
-	listener *listener.Stream,
+	stream *listener.Stream,
 	deathChan chan struct{},
 ) {
 	k.mgr.Logger().Debugf("Consuming messages from wal log\n")
 	defer k.mgr.Logger().Debugf("Stopped consuming messages from wal log\n")
 	defer close(deathChan)
 
-	batchPolicy, err := k.batching.NewBatcher(k.mgr)
+	batchPolicy, err := NewPeekBatch(&k.batching, k.mgr)
 	if err != nil {
 		k.mgr.Logger().Errorf("Failed to initialise batch policy: %v, falling back to no policy.\n", err)
 		conf := service.BatchPolicy{Count: 1}
-		if batchPolicy, err = conf.NewBatcher(k.mgr); err != nil {
+		if batchPolicy, err = NewPeekBatch(&conf, k.mgr); err != nil {
 			panic(err)
 		}
 	}
@@ -59,9 +59,19 @@ func (k *pgWalReader) runPartitionConsumer(
 		flushBatch = k.syncCheckpointer()
 	}
 
-	latestOffset := listener.GetRestartLSN()
+	latestOffset := stream.GetRestartLSN()
 
 	k.mgr.Logger().Tracef("Benthos consumer got initial offset: %v\n", latestOffset)
+
+	flushWrapper := func() bool {
+		nextTimedBatchChan = nil
+		flushedBatch, err := batchPolicy.Flush(ctx)
+		if err != nil {
+			k.mgr.Logger().Debugf("Timed flush batch error: %w", err)
+			return false
+		}
+		return flushBatch(ctx, k.msgChan, flushedBatch, latestOffset)
+	}
 
 partMsgLoop:
 	for {
@@ -72,43 +82,47 @@ partMsgLoop:
 		}
 		select {
 		case <-nextTimedBatchChan:
+			k.mgr.Logger().Trace("Flushing timed batch")
 			nextTimedBatchChan = nil
-			flushedBatch, err := batchPolicy.Flush(ctx)
-			if err != nil {
-				k.mgr.Logger().Debugf("Timed flush batch error: %w", err)
+			if !flushWrapper() {
 				break partMsgLoop
 			}
-			if !flushBatch(ctx, k.msgChan, flushedBatch, latestOffset) {
+		case data, open := <-stream.ChangeChannel:
+			if !open {
 				break partMsgLoop
 			}
-		case data, open := <-listener.ChangeChannel:
-			if !open || data.Error != nil {
-				if data.Error != nil {
-					k.mgr.Logger().Errorf("Wal message recv error: %v\n", data.Error)
+			k.mgr.Logger().Tracef("Received message from channel: %v, BufferMsgs: %v, IsFull: %v, Room: %v\n", data, batchPolicy.Count(), batchPolicy.IsFull(), batchPolicy.Room())
+
+			switch v := data.(type) {
+			case *listener.WalChangeCommit:
+				latestOffset = v.NextLSN
+				k.mgr.Logger().Tracef("Received commit message with offset: %v\n", latestOffset)
+
+				// If the batch is already full, flush now
+				if batchPolicy.IsFull() {
+					k.mgr.Logger().Trace("Flushing commit batch")
+					if !flushWrapper() {
+						break partMsgLoop
+					}
 				}
-				break partMsgLoop
+				continue
+			case *listener.WalChangeBegin:
+				continue
 			}
 
-			for i, msg := range data.Change.Changes {
-				// Only update the offset if we are the last message
-				// This is to prevent commiting the offset before all messages from the given LSN are processed
-				if i == len(data.Change.Changes)-1 {
-					latestOffset = data.Change.Lsn
-				}
-				part := dataToPart(data.Change.Lsn, &msg)
-				if batchPolicy.Add(part) {
-					k.mgr.Logger().Tracef("Flushing message batch\n")
-					nextTimedBatchChan = nil
-					flushedBatch, err := batchPolicy.Flush(ctx)
-					if err != nil {
-						k.mgr.Logger().Errorf("Flush batch error: %w", err)
-						break partMsgLoop
-					}
-					if !flushBatch(ctx, k.msgChan, flushedBatch, latestOffset) {
-						k.mgr.Logger().Errorf("Failed to flush batch: %v\n", err)
+			msg := dataToPart(&data)
+
+			if msg != nil {
+				// If the batch is already full, flush now
+				// This intentionally happens before adding the message to the batch
+				// This prevents flushing the last message of a transaction before the commit
+				if batchPolicy.IsFull() {
+					if !flushWrapper() {
 						break partMsgLoop
 					}
 				}
+
+				batchPolicy.Add(msg)
 			}
 		case <-ctx.Done():
 			break partMsgLoop
@@ -120,7 +134,7 @@ partMsgLoop:
 
 func (k *pgWalReader) connectExplicitTopics(ctx context.Context, streamConfig *listener.PgStreamConfig) (err error) {
 	var consumer *listener.Stream
-	streamConfig.ChangeChannel = make(chan listener.WalMessage)
+	streamConfig.ChangeChannel = make(chan listener.WalChange)
 
 	defer func() {
 		if err != nil {
@@ -146,49 +160,6 @@ func (k *pgWalReader) connectExplicitTopics(ctx context.Context, streamConfig *l
 
 	deathChan := make(chan struct{})
 	go k.runPartitionConsumer(ctx, consumer, deathChan)
-
-	// for topic, partitions := range k.topicPartitions {
-	// 	for _, partition := range partitions {
-	// 		topic := topic
-	// 		partition := partition
-
-	// 		offset := sarama.OffsetNewest
-	// 		if k.startFromOldest {
-	// 			offset = sarama.OffsetOldest
-	// 		}
-	// 		if block := offsetRes.GetBlock(topic, partition); block != nil {
-	// 			if block.Err == sarama.ErrNoError {
-	// 				if block.Offset > 0 {
-	// 					offset = block.Offset
-	// 				}
-	// 			} else {
-	// 				k.mgr.Logger().Debugf("Failed to acquire offset for topic %v partition %v: %v\n", topic, partition, block.Err)
-	// 			}
-	// 		} else {
-	// 			k.mgr.Logger().Debugf("Failed to acquire offset for topic %v partition %v\n", topic, partition)
-	// 		}
-
-	// 		var partConsumer sarama.PartitionConsumer
-	// 		if partConsumer, err = consumer.ConsumePartition(topic, partition, offset); err != nil {
-	// 			// TODO: Actually verify the error was caused by a non-existent offset
-	// 			if k.startFromOldest {
-	// 				offset = sarama.OffsetOldest
-	// 				k.mgr.Logger().Warnf("Failed to read from stored offset, restarting from oldest offset: %v\n", err)
-	// 			} else {
-	// 				offset = sarama.OffsetNewest
-	// 				k.mgr.Logger().Warnf("Failed to read from stored offset, restarting from newest offset: %v\n", err)
-	// 			}
-	// 			if partConsumer, err = consumer.ConsumePartition(topic, partition, offset); err != nil {
-	// 				doneFn()
-	// 				return fmt.Errorf("failed to consume topic %v partition %v: %v", topic, partition, err)
-	// 			}
-	// 		}
-
-	// 		consumerWG.Add(1)
-	// 		partConsumers = append(partConsumers, partConsumer)
-	// 		go k.runPartitionConsumer(ctx, &consumerWG, topic, partition, partConsumer)
-	// 	}
-	// }
 
 	doneCtx, doneFn := context.WithCancel(context.Background())
 	go func() {

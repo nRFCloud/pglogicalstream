@@ -65,7 +65,7 @@ pg_wal:
   auto_replay_nacks: true
   failover: true
   batching:
-    count: 10
+    count: 3
     period: 10s
 `)
 
